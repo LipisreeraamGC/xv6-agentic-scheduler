@@ -1,0 +1,10 @@
+# i386, i8086
+set arch i386:x86-64
+# 1234 will be replaced (see Makefile)
+target remote localhost:1234
+sym kernel
+# debugging mbr: b *0x7c00
+b _start
+c
+
+## Workaround is removed (2019): https://wiki.osdev.org/QEMU_and_GDB_in_long_mode

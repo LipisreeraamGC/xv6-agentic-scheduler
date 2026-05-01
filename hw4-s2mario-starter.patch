@@ -1,0 +1,297 @@
+From b627bc155556531b6b640f91c40e38d7d9579fa3 Mon Sep 17 00:00:00 2001
+From: xjtuwxg <xjtuwxg@gmail.com>
+Date: Sun, 15 Feb 2026 10:59:04 -0600
+Subject: [PATCH] hw4 bonus: add s2mario starter with console raw-input TODOs
+
+---
+ Makefile  |   2 +-
+ console.c |  41 ++++++++++++---
+ file.c    |   7 +--
+ mario.c   | 155 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 191 insertions(+), 14 deletions(-)
+ create mode 100644 mario.c
+
+diff --git a/Makefile b/Makefile
+index dc5b866..5bfa9bb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -118,7 +118,7 @@ mkfs: mkfs.c fs.h
+ 
+ UPROGS= \
+ 	_cat _echo _forktest _grep _init _kill _ln _ls _mkdir \
+-	_rm _sh _stressfs _usertests _wc _zombie _prettyprint _imshow\
++	_rm _sh _stressfs _usertests _wc _zombie _prettyprint _imshow _mario\
+ #
+ 
+ fs.img: mkfs README cover.raw $(UPROGS)
+diff --git a/console.c b/console.c
+index bac674b..0b7c841 100644
+--- a/console.c
++++ b/console.c
+@@ -202,6 +202,7 @@ struct {
+   uint r;  // Read index
+   uint w;  // Write index
+   uint e;  // Edit index
++  int raw; // non-zero when console input should bypass line editing/echo
+ } input;
+ 
+ #define C(x)  ((x)-'@')  // Control-x
+@@ -213,13 +214,23 @@ consoleintr(int (*getc)(void))
+ 
+   acquire(&input.lock);
+   while((c = getc()) >= 0){
+-    switch(c){
+-    case C('Z'): // reboot
++    if (c == C('Z')) { // reboot
+       lidt(0,0);
+-      break;
+-    case C('P'):  // Process listing.
++      continue;
++    }
++    if (c == C('P')) {  // Process listing.
+       procdump();
+-      break;
++      continue;
++    }
++
++    if (input.raw) {
++      // TODO(hw4-bonus): raw path buffering
++      // Goal: enqueue each key in input.buf and wake readers immediately.
++      // Hint: update input.e/input.w while keeping ring-buffer bounds checks.
++      continue;
++    }
++
++    switch(c){
+     case C('U'):  // Kill line.
+       while(input.e != input.w &&
+           input.buf[(input.e-1) % INPUT_BUF] != '\n'){
+@@ -277,7 +288,8 @@ consoleread(struct file *f, char *dst, int n)
+     }
+     *dst++ = c;
+     --n;
+-    if (c == '\n')
++    // TODO(hw4-bonus): in raw mode, return after reading one character.
++    if (input.raw || c == '\n')
+       break;
+   }
+   release(&input.lock);
+@@ -288,8 +300,20 @@ consoleread(struct file *f, char *dst, int n)
+ int
+ consoleioctl(struct file *f, int param, int value)
+ {
+-  cprintf("Got unknown console ioctl request. %d = %d\n",param,value);
+-  return -1;
++  if(param==3) {
++    // TODO(hw4-bonus): raw mode toggle
++    // Goal: set input.raw to 0/1 and reset input.r/input.w/input.e.
++    // Starter behavior: return success so user code can be written first.
++    return 0;
++  }
++  else if(param==4) { // non-blocking fetch of one char when in raw mode
++    // TODO(hw4-bonus): if raw buffer has data, pop one char; else return -1.
++    return -1;
++  }
++  else {
++    cprintf("Got unknown console ioctl request. %d = %d\n",param,value);
++    return -1;
++  }
+ }
+ 
+ int
+@@ -310,6 +334,7 @@ consoleinit(void)
+ {
+   initlock(&cons.lock, "console");
+   initlock(&input.lock, "input");
++  input.raw = 0;
+ 
+   devsw[CONSOLE].write = consolewrite;
+   devsw[CONSOLE].read = consoleread;
+diff --git a/file.c b/file.c
+index 5fcc9a9..3a52163 100644
+--- a/file.c
++++ b/file.c
+@@ -84,13 +84,11 @@ fileclose(struct file *f)
+ int
+ fileioctl(struct file *f, int param, int value) {
+   if(devsw[f->ip->major].ioctl) {
+-    devsw[f->ip->major].ioctl(f,param,value);
+-  }
+-  else {
++    return devsw[f->ip->major].ioctl(f,param,value);
++  } else {
+     cprintf("Got unknown IOCTL for dev=%d, major=%d, minor=%d, %d=%d\n",f->ip->dev,(int)f->ip->major,(int)f->ip->minor,param,value);
+     return -1;
+   }
+-  return 0;
+ }
+ 
+ // Get metadata about file f.
+@@ -182,4 +180,3 @@ filewrite(struct file *f, char *addr, int n)
+   }
+   panic("filewrite");
+ }
+-
+diff --git a/mario.c b/mario.c
+new file mode 100644
+index 0000000..8fc03c4
+--- /dev/null
++++ b/mario.c
+@@ -0,0 +1,155 @@
++// Simple Super Mario demo for xv6 VGA Mode 13h.
++// This file is intentionally minimal for HW4 bonus.
++#include "types.h"
++#include "user.h"
++#include "fcntl.h"
++
++#define SCREEN_WIDTH  320
++#define SCREEN_HEIGHT 200
++#define SCREEN_SIZE   (SCREEN_WIDTH * SCREEN_HEIGHT)
++#define MARIO_W       16
++#define MARIO_H       16
++
++int fd;
++unsigned char framebuffer[SCREEN_SIZE];
++
++// 16x16 sprite; 0 means transparent/background.
++unsigned char mario_sprite[MARIO_W * MARIO_H] = {
++  0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,
++  0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0,
++  0,0,3,3,3,2,2,3,2,0,0,0,0,0,0,0,
++  0,3,2,3,2,2,2,3,2,2,2,0,0,0,0,0,
++  0,3,2,3,3,2,2,2,3,2,2,2,0,0,0,0,
++  0,3,3,2,2,2,2,3,3,3,3,0,0,0,0,0,
++  0,0,0,2,2,2,2,2,2,2,0,0,0,0,0,0,
++  0,0,1,1,3,1,1,3,1,1,0,0,0,0,0,0,
++  0,1,1,1,3,1,1,3,1,1,1,0,0,0,0,0,
++  1,1,1,1,3,3,3,3,1,1,1,1,0,0,0,0,
++  2,2,1,3,2,3,3,2,3,1,2,2,0,0,0,0,
++  2,2,2,3,3,3,3,3,3,2,2,2,0,0,0,0,
++  2,2,3,3,3,3,3,3,3,3,2,2,0,0,0,0,
++  0,0,3,3,3,0,0,3,3,3,0,0,0,0,0,0,
++  0,3,3,3,0,0,0,0,3,3,3,0,0,0,0,0,
++  3,3,3,3,0,0,0,0,3,3,3,3,0,0,0,0
++};
++
++void set_palette(int index, int r, int g, int b) {
++  if (ioctl(fd, 2, (index << 24) | (r << 16) | (g << 8) | b) < 0)
++    printf(2, "Error setting palette color.\n");
++}
++
++void init_palette(void) {
++  set_palette(0, 0, 0, 0);      // transparent/background
++  set_palette(1, 63, 0, 0);     // red
++  set_palette(2, 63, 50, 30);   // skin tone
++  set_palette(3, 0, 0, 63);     // blue
++  set_palette(4, 0, 40, 0);     // ground
++  set_palette(5, 30, 30, 63);   // sky
++}
++
++void draw_pixel(int x, int y, unsigned char color) {
++  if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT)
++    return;
++  framebuffer[y * SCREEN_WIDTH + x] = color;
++}
++
++void draw_rect(int x, int y, int w, int h, unsigned char color) {
++  int i, j;
++  for (j = 0; j < h; j++)
++    for (i = 0; i < w; i++)
++      draw_pixel(x + i, y + j, color);
++}
++
++void draw_mario(int x, int y) {
++  int row, col;
++  for (row = 0; row < MARIO_H; row++) {
++    for (col = 0; col < MARIO_W; col++) {
++      unsigned char c = mario_sprite[row * MARIO_W + col];
++      if (c)
++        draw_pixel(x + col, y + row, c);
++    }
++  }
++}
++
++void render(void) {
++  close(fd);
++  fd = open("display", O_WRONLY);
++  if (fd < 0) {
++    printf(2, "Error reopening display\n");
++    exit();
++  }
++  write(fd, framebuffer, SCREEN_SIZE);
++}
++
++int main(int argc, char **argv) {
++  int mario_x = 100;
++  int mario_y = 0x90;
++  int velocity_y = 0;
++  int is_jumping = 0;
++
++  fd = open("display", O_WRONLY);
++  if (fd < 0) {
++    printf(2, "display not found\n");
++    exit();
++  }
++
++  if (ioctl(fd, 1, 0x13) < 0) {
++    printf(2, "error: ioctl to switch to VGA mode failed.\n");
++    exit();
++  }
++
++  init_palette();
++
++  // Enable raw input mode (implemented by students in console.c TODOs).
++  if (ioctl(0, 3, 1) < 0) {
++    printf(2, "error: ioctl to enable raw mode failed.\n");
++    exit();
++  }
++
++  printf(1, "Controls: A/D move, W jump, Q quit\n");
++
++  for (;;) {
++    int key = ioctl(0, 4, 0); // non-blocking key fetch
++
++    memset(framebuffer, 5, SCREEN_SIZE);
++    draw_rect(0, 160, SCREEN_WIDTH, 40, 4);
++
++    if (key >= 0) {
++      char input = (char)key;
++      if (input == 'a')
++        mario_x -= 3;
++      if (input == 'd')
++        mario_x += 3;
++      if (input == 'w' && !is_jumping) {
++        velocity_y = -12;
++        is_jumping = 1;
++      }
++      if (input == 'q')
++        break;
++    }
++
++    if (mario_x < 0)
++      mario_x = 0;
++    if (mario_x > SCREEN_WIDTH - MARIO_W)
++      mario_x = SCREEN_WIDTH - MARIO_W;
++
++    mario_y += velocity_y;
++    velocity_y += 2; // gravity
++
++    if (mario_y > 0x8f) {
++      mario_y = 0x90;
++      velocity_y = 0;
++      is_jumping = 0;
++    }
++
++    draw_mario(mario_x, mario_y);
++    render();
++    sleep(2);
++  }
++
++  ioctl(0, 3, 0);      // disable raw mode
++  ioctl(fd, 1, 0x3);   // back to text mode
++  close(fd);
++  exit();
++  return 0;
++}
+-- 
+2.50.1
+

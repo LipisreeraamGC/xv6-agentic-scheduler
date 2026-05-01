@@ -1,0 +1,534 @@
+From c4655635b23ab86c43e80fedcffaeb29f050f0ad Mon Sep 17 00:00:00 2001
+From: LipisreeraamGC <lgata@uic.edu>
+Date: Wed, 11 Mar 2026 17:16:49 -0500
+Subject: [PATCH] hw4-bonus: implement raw input mode and full s2mario game
+
+- console.c: add input.raw flag to input struct
+- TODO 1: raw path buffering in consoleintr() - bypass line editing,
+  enqueue directly into ring buffer and wakeup readers immediately
+- TODO 2: raw mode toggle via consoleioctl param 3 - set input.raw
+  and reset ring buffer indices to flush stale characters
+- TODO 3: non-blocking key fetch via consoleioctl param 4 - pop one
+  char under input.lock or return -1 if buffer empty
+- console.c: consoleread breaks after one char in raw mode
+- console.c: consoleinit zeroes input.raw on boot
+- file.c: fix fileioctl to return device handler result (was discarding it)
+- Makefile: add _mario to UPROGS
+- mario.c: full s2mario game with sky, ground, platforms, coins, HUD
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ Makefile  |   2 +-
+ console.c |  30 ++++-
+ file.c    |   6 +-
+ mario.c   | 396 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 428 insertions(+), 6 deletions(-)
+ create mode 100644 mario.c
+
+diff --git a/Makefile b/Makefile
+index 5985c4b..aebbf27 100644
+--- a/Makefile
++++ b/Makefile
+@@ -118,7 +118,7 @@ mkfs: mkfs.c fs.h
+ 
+ UPROGS= \
+ 	_cat _echo _forktest _grep _init _kill _ln _ls _mkdir \
+-	_rm _sh _stressfs _usertests _wc _zombie _prettyprint _imshow\
++	_rm _sh _stressfs _usertests _wc _zombie _prettyprint _imshow _mario\
+ #
+ 
+ fs.img: mkfs README cover.raw $(UPROGS)
+diff --git a/console.c b/console.c
+index 63cdc72..481da3e 100644
+--- a/console.c
++++ b/console.c
+@@ -204,6 +204,7 @@ struct {
+   uint r;  // Read index
+   uint w;  // Write index
+   uint e;  // Edit index
++  int raw; /* raw input mode flag */
+ } input;
+ 
+ #define C(x)  ((x)-'@')  // Control-x
+@@ -215,6 +216,14 @@ consoleintr(int (*getc)(void))
+ 
+   acquire(&input.lock);
+   while((c = getc()) >= 0){
++    if(input.raw){
++      /* raw mode: enqueue immediately, no line editing */
++      if(input.e - input.r < INPUT_BUF){
++        input.buf[input.e++ % INPUT_BUF] = c;
++        wakeup(&input.r);
++      }
++      continue;
++    }
+     switch(c){
+     case C('Z'): // reboot
+       lidt(0,0);
+@@ -279,7 +288,7 @@ consoleread(struct file *f, char *dst, int n)
+     }
+     *dst++ = c;
+     --n;
+-    if (c == '\n')
++    if (input.raw || c == '\n')
+       break;
+   }
+   release(&input.lock);
+@@ -299,6 +308,24 @@ consoleioctl(struct file *f, int param, int value)
+   global_console_color = value;
+   return 0;
+   }
++  else if(param == 3){
++    /* TODO(hw4-bonus): toggle raw input mode */
++    acquire(&input.lock);
++    input.raw = value;
++    input.r = input.w = input.e = 0;  /* flush stale input on mode switch */
++    release(&input.lock);
++    return 0;
++  }
++  else if(param == 4){
++    /* TODO(hw4-bonus): non-blocking key fetch */
++    int c = -1;
++    acquire(&input.lock);
++    if(input.r < input.e){
++      c = input.buf[input.r++ % INPUT_BUF];
++    }
++    release(&input.lock);
++    return c;
++  }
+   cprintf("Got unknown console ioctl request. %d = %d\n",param,value);
+   return -1;
+ }
+@@ -325,6 +352,7 @@ consoleinit(void)
+ {
+   initlock(&cons.lock, "console");
+   initlock(&input.lock, "input");
++  input.raw = 0;
+ 
+   devsw[CONSOLE].write = consolewrite;
+   devsw[CONSOLE].read = consoleread;
+diff --git a/file.c b/file.c
+index 5fcc9a9..018cb87 100644
+--- a/file.c
++++ b/file.c
+@@ -84,13 +84,11 @@ fileclose(struct file *f)
+ int
+ fileioctl(struct file *f, int param, int value) {
+   if(devsw[f->ip->major].ioctl) {
+-    devsw[f->ip->major].ioctl(f,param,value);
+-  }
+-  else {
++    return devsw[f->ip->major].ioctl(f,param,value);
++  } else {
+     cprintf("Got unknown IOCTL for dev=%d, major=%d, minor=%d, %d=%d\n",f->ip->dev,(int)f->ip->major,(int)f->ip->minor,param,value);
+     return -1;
+   }
+-  return 0;
+ }
+ 
+ // Get metadata about file f.
+diff --git a/mario.c b/mario.c
+new file mode 100644
+index 0000000..b399a40
+--- /dev/null
++++ b/mario.c
+@@ -0,0 +1,396 @@
++// s2mario - Super Simple Mario for xv6 VGA Mode 13h (320x200, 256 colors).
++// Full game: sky, ground, platforms, coins, HUD.
++#include "types.h"
++#include "user.h"
++#include "fcntl.h"
++
++/* ---------- Screen ---------- */
++#define SW    320
++#define SH    200
++#define SSIZ  (SW * SH)
++
++/* ---------- Palette indices (6-bit DAC values 0-63) ---------- */
++#define PAL_BLACK   0   /* transparent */
++#define PAL_MRED    1   /* mario hat/shirt */
++#define PAL_SKIN    2   /* mario face/hands */
++#define PAL_MBLUE   3   /* mario overalls */
++#define PAL_SKY     4   /* periwinkle sky */
++#define PAL_GRASS   5   /* bright green grass top */
++#define PAL_DIRT    6   /* darker green dirt fill */
++#define PAL_BRICK   7   /* brown platform block */
++#define PAL_BRKD    8   /* dark brown brick detail */
++#define PAL_COIN    9   /* bright yellow coin */
++#define PAL_WHITE  10   /* white - HUD text */
++
++/* ---------- World layout ---------- */
++#define GROUND_Y  152   /* y of grass strip top (Mario's floor) */
++#define MARIO_W    16
++#define MARIO_H    16
++#define COIN_W      8
++#define COIN_H      8
++
++/* ---------- Sprites ---------- */
++
++/* 16x16 Mario: 0=transparent, 1=hat/shirt, 2=skin, 3=overalls */
++static unsigned char mario_spr[MARIO_H][MARIO_W] = {
++  {0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0},
++  {0,0,1,1,1,1,1,1,1,1,1,0,0,0,0,0},
++  {0,0,3,3,3,2,2,3,2,0,0,0,0,0,0,0},
++  {0,3,2,3,2,2,2,3,2,2,2,0,0,0,0,0},
++  {0,3,2,3,3,2,2,2,3,2,2,2,0,0,0,0},
++  {0,3,3,2,2,2,2,3,3,3,3,0,0,0,0,0},
++  {0,0,0,2,2,2,2,2,2,2,0,0,0,0,0,0},
++  {0,0,1,1,3,1,1,3,1,1,0,0,0,0,0,0},
++  {0,1,1,1,3,1,1,3,1,1,1,0,0,0,0,0},
++  {1,1,1,1,3,3,3,3,1,1,1,1,0,0,0,0},
++  {2,2,1,3,2,3,3,2,3,1,2,2,0,0,0,0},
++  {2,2,2,3,3,3,3,3,3,2,2,2,0,0,0,0},
++  {2,2,3,3,3,3,3,3,3,3,2,2,0,0,0,0},
++  {0,0,3,3,3,0,0,3,3,3,0,0,0,0,0,0},
++  {0,3,3,3,0,0,0,0,3,3,3,0,0,0,0,0},
++  {3,3,3,3,0,0,0,0,3,3,3,3,0,0,0,0}
++};
++
++/* 8x8 coin: 0=transparent, 9=yellow, 10=white highlight */
++static unsigned char coin_spr[COIN_H][COIN_W] = {
++  { 0,  0,  9,  9,  0,  0,  0,  0},
++  { 0,  9,  9,  9,  9,  0,  0,  0},
++  { 9,  9, 10, 10,  9,  9,  0,  0},
++  { 9,  9, 10, 10,  9,  9,  0,  0},
++  { 9,  9,  9,  9,  9,  9,  0,  0},
++  { 9,  9,  9,  9,  9,  9,  0,  0},
++  { 0,  9,  9,  9,  9,  0,  0,  0},
++  { 0,  0,  9,  9,  0,  0,  0,  0}
++};
++
++/*
++ * 5x5 pixel bitmap font. Each byte: bits 7..3 = pixels left-to-right.
++ * Rendered 2x scaled -> each char is 10x10 px (12px stride with 2px gap).
++ */
++static unsigned char font5[128][5] = {
++  [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
++  [':'] = {0x00, 0x20, 0x00, 0x20, 0x00},
++  ['0'] = {0x70, 0x88, 0x88, 0x88, 0x70},
++  ['1'] = {0x20, 0x60, 0x20, 0x20, 0x70},
++  ['2'] = {0x70, 0x88, 0x30, 0x40, 0xF8},
++  ['3'] = {0x70, 0x08, 0x30, 0x08, 0x70},
++  ['4'] = {0x88, 0x88, 0xF8, 0x08, 0x08},
++  ['5'] = {0xF8, 0x80, 0xF0, 0x08, 0xF0},
++  ['6'] = {0x70, 0x80, 0xF0, 0x88, 0x70},
++  ['7'] = {0xF8, 0x08, 0x10, 0x20, 0x20},
++  ['8'] = {0x70, 0x88, 0x70, 0x88, 0x70},
++  ['9'] = {0x70, 0x88, 0x78, 0x08, 0x70},
++  ['B'] = {0xF0, 0x88, 0xF0, 0x88, 0xF0},
++  ['C'] = {0x70, 0x80, 0x80, 0x80, 0x70},
++  ['E'] = {0xF8, 0x80, 0xF0, 0x80, 0xF8},
++  ['I'] = {0x70, 0x20, 0x20, 0x20, 0x70},
++  ['N'] = {0x88, 0xC8, 0xA8, 0x98, 0x88},
++  ['O'] = {0x70, 0x88, 0x88, 0x88, 0x70},
++  ['S'] = {0x78, 0x80, 0x70, 0x08, 0xF0},
++  ['T'] = {0xF8, 0x20, 0x20, 0x20, 0x20},
++};
++
++/* ---------- Global state ---------- */
++static unsigned char fb[SSIZ];  /* software framebuffer */
++static int fd;                   /* display file descriptor */
++
++/* Platforms: {x, y, w, h} - two brown block platforms */
++static int plat_x[2] = { 48, 224};
++static int plat_y[2] = {120,  96};
++static int plat_w[2] = { 32,  48};
++static int plat_h[2] = { 16,  56};
++
++/* Coins */
++static int coin_x[2]     = { 80, 208};
++static int coin_y[2]     = {104,  78};
++static int coin_alive[2] = {  1,   1};
++
++/* ---------- Drawing primitives ---------- */
++
++static void
++draw_pixel(int x, int y, unsigned char c)
++{
++  if (x >= 0 && x < SW && y >= 0 && y < SH)
++    fb[y * SW + x] = c;
++}
++
++static void
++fill_rect(int x, int y, int w, int h, unsigned char c)
++{
++  int i, j;
++  for (j = y; j < y + h; j++)
++    for (i = x; i < x + w; i++)
++      draw_pixel(i, j, c);
++}
++
++/* ---------- World rendering ---------- */
++
++static void
++draw_background(void)
++{
++  memset(fb, PAL_SKY, SSIZ);
++}
++
++static void
++draw_ground(void)
++{
++  int x, y;
++  /* Bright green grass strip */
++  fill_rect(0, GROUND_Y, SW, 8, PAL_GRASS);
++  /* Darker dirt fill */
++  fill_rect(0, GROUND_Y + 8, SW, SH - (GROUND_Y + 8), PAL_DIRT);
++  /* Brick dot pattern on dirt */
++  for (y = GROUND_Y + 8; y < SH; y += 8)
++    for (x = 4; x < SW; x += 8)
++      draw_pixel(x, y + 4, PAL_BRKD);
++}
++
++static void
++draw_platform(int px, int py, int pw, int ph)
++{
++  int x, y;
++  fill_rect(px, py, pw, ph, PAL_BRICK);
++  /* Dark top edge */
++  fill_rect(px, py, pw, 1, PAL_BRKD);
++  /* Brick mortar dots */
++  for (y = py + 3; y < py + ph; y += 5)
++    for (x = px + 3; x < px + pw; x += 8)
++      draw_pixel(x, y, PAL_BRKD);
++}
++
++static void
++draw_coin(int cx, int cy)
++{
++  int r, c;
++  for (r = 0; r < COIN_H; r++)
++    for (c = 0; c < COIN_W; c++)
++      if (coin_spr[r][c])
++        draw_pixel(cx + c, cy + r, coin_spr[r][c]);
++}
++
++
++static void
++draw_mario_sprite(int mx, int my)
++{
++  /* Map sprite indices to palette: 1=MRED, 2=SKIN, 3=MBLUE */
++  static unsigned char remap[4] = {0, PAL_MRED, PAL_SKIN, PAL_MBLUE};
++  int r, c;
++  for (r = 0; r < MARIO_H; r++)
++    for (c = 0; c < MARIO_W; c++) {
++      unsigned char p = mario_spr[r][c];
++      if (p) draw_pixel(mx + c, my + r, remap[p]);
++    }
++}
++
++/* ---------- HUD text rendering ---------- */
++
++/* Draw one character from font5 at (x,y), 2x scaled */
++static void
++draw_char(int x, int y, char ch, unsigned char color)
++{
++  int row, col, bit;
++  unsigned char idx = (unsigned char)ch;
++  if (idx >= 128) return;
++  for (row = 0; row < 5; row++) {
++    for (col = 0; col < 5; col++) {
++      bit = (font5[idx][row] >> (7 - col)) & 1;
++      if (bit) {
++        /* 2x2 block per pixel */
++        draw_pixel(x + col*2,     y + row*2,     color);
++        draw_pixel(x + col*2 + 1, y + row*2,     color);
++        draw_pixel(x + col*2,     y + row*2 + 1, color);
++        draw_pixel(x + col*2 + 1, y + row*2 + 1, color);
++      }
++    }
++  }
++}
++
++/* Each character is 12px wide (10px glyph + 2px gap) */
++static void
++draw_str(int x, int y, char *s, unsigned char color)
++{
++  while (*s) {
++    draw_char(x, y, *s, color);
++    x += 12;
++    s++;
++  }
++}
++
++/* Draw a non-negative integer */
++static void
++draw_int(int x, int y, int n, unsigned char color)
++{
++  char buf[12];
++  int i = 0, lo, hi;
++  char t;
++  if (n == 0) {
++    buf[i++] = '0';
++  } else {
++    while (n > 0) {
++      buf[i++] = '0' + (n % 10);
++      n /= 10;
++    }
++    for (lo = 0, hi = i - 1; lo < hi; lo++, hi--) {
++      t = buf[lo]; buf[lo] = buf[hi]; buf[hi] = t;
++    }
++  }
++  buf[i] = '\0';
++  draw_str(x, y, buf, color);
++}
++
++static void
++draw_hud(int coins, int best)
++{
++  draw_str(4, 3, "COINS:", PAL_WHITE);
++  draw_int(4 + 6 * 12, 3, coins, PAL_COIN);
++  draw_str(192, 3, "BEST:", PAL_WHITE);
++  draw_int(192 + 5 * 12, 3, best, PAL_WHITE);
++}
++
++/* ---------- Display helpers ---------- */
++
++static void
++set_pal(int idx, int r, int g, int b)
++{
++  ioctl(fd, 2, (idx << 24) | (r << 16) | (g << 8) | b);
++}
++
++static void
++init_palette(void)
++{
++  set_pal(PAL_BLACK,  0,  0,  0);
++  set_pal(PAL_MRED,  55,  8,  8);   /* mario red */
++  set_pal(PAL_SKIN,  58, 40, 22);   /* warm skin */
++  set_pal(PAL_MBLUE,  5, 10, 55);   /* deep blue */
++  set_pal(PAL_SKY,   20, 22, 58);   /* periwinkle */
++  set_pal(PAL_GRASS,  8, 48,  8);   /* bright green */
++  set_pal(PAL_DIRT,   8, 28,  8);   /* dark green */
++  set_pal(PAL_BRICK, 40, 22, 10);   /* brown */
++  set_pal(PAL_BRKD,  22, 10,  4);   /* dark brown */
++  set_pal(PAL_COIN,  62, 56,  4);   /* yellow */
++  set_pal(PAL_WHITE, 62, 62, 62);   /* near-white */
++}
++
++/* Reopen display to reset f->off to 0 for a full-frame write */
++static void
++render(void)
++{
++  close(fd);
++  fd = open("display", O_WRONLY);
++  if (fd < 0) {
++    printf(2, "render: can't open display\n");
++    exit();
++  }
++  write(fd, fb, SSIZ);
++}
++
++/* ---------- Main ---------- */
++
++int
++main(int argc, char **argv)
++{
++  int mario_x = 20;
++  int mario_y = GROUND_Y - MARIO_H;  /* standing on ground */
++  int mario_vy = 0;
++  int on_ground = 1;
++  int coins = 0;
++  int best = 0;
++  int i;
++
++  fd = open("display", O_WRONLY);
++  if (fd < 0) {
++    printf(2, "display not found\n");
++    exit();
++  }
++
++  if (ioctl(fd, 1, 0x13) < 0) {
++    printf(2, "error: VGA mode switch failed\n");
++    exit();
++  }
++
++  init_palette();
++
++  if (ioctl(0, 3, 1) < 0) {
++    printf(2, "error: raw mode failed\n");
++    exit();
++  }
++
++  for (;;) {
++    int key = ioctl(0, 4, 0);  /* non-blocking key fetch */
++    int mario_vx = 0;
++
++    /* --- Input --- */
++    if (key == 'q' || key == 'Q')
++      break;
++    if (key == 'a' || key == 'A')
++      mario_vx = -3;
++    if (key == 'd' || key == 'D')
++      mario_vx = 3;
++    if ((key == 'w' || key == 'W') && on_ground) {
++      mario_vy = -10;
++      on_ground = 0;
++    }
++
++    /* --- Physics --- */
++    mario_vy += 1;   /* gravity */
++    mario_x  += mario_vx;
++    mario_y  += mario_vy;
++
++    if (mario_x < 0)             mario_x = 0;
++    if (mario_x + MARIO_W > SW)  mario_x = SW - MARIO_W;
++
++    on_ground = 0;
++
++    /* Ground */
++    if (mario_y + MARIO_H >= GROUND_Y) {
++      mario_y  = GROUND_Y - MARIO_H;
++      mario_vy = 0;
++      on_ground = 1;
++    }
++
++    /* Platform collisions: land on top only */
++    for (i = 0; i < 2; i++) {
++      int prev_feet = mario_y + MARIO_H - mario_vy;
++      if (mario_vy >= 0 &&
++          mario_x + MARIO_W > plat_x[i] &&
++          mario_x            < plat_x[i] + plat_w[i] &&
++          prev_feet         <= plat_y[i] &&
++          mario_y + MARIO_H >= plat_y[i]) {
++        mario_y  = plat_y[i] - MARIO_H;
++        mario_vy = 0;
++        on_ground = 1;
++      }
++    }
++
++    /* Coin collection (AABB) */
++    for (i = 0; i < 2; i++) {
++      if (coin_alive[i] &&
++          mario_x + MARIO_W > coin_x[i] &&
++          mario_x            < coin_x[i] + COIN_W &&
++          mario_y + MARIO_H  > coin_y[i] &&
++          mario_y            < coin_y[i] + COIN_H) {
++        coin_alive[i] = 0;
++        coins++;
++        if (coins > best) best = coins;
++      }
++    }
++
++    /* --- Render --- */
++    draw_background();
++    draw_ground();
++    for (i = 0; i < 2; i++)
++      draw_platform(plat_x[i], plat_y[i], plat_w[i], plat_h[i]);
++    for (i = 0; i < 2; i++)
++      if (coin_alive[i]) draw_coin(coin_x[i], coin_y[i]);
++    draw_mario_sprite(mario_x, mario_y);
++    draw_hud(coins, best);
++    render();
++    sleep(2);
++  }
++
++  ioctl(0, 3, 0);     /* disable raw mode */
++  ioctl(fd, 1, 0x3);  /* restore text mode */
++  close(fd);
++  exit();
++  return 0;
++}
+-- 
+2.52.0
+

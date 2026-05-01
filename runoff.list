@@ -1,0 +1,75 @@
+# basic headers
+types.h
+param.h
+memlayout.h
+defs.h
+x86.h
+asm.h
+mmu.h
+elf.h
+
+# bootloader
+bootasm.S
+bootmain.c
+
+# entering xv6
+entry.S
+entryother.S
+main.c
+kernel.ld
+
+# locks
+spinlock.h
+spinlock.c
+
+# processes
+vm.c
+proc.h
+proc.c
+swtch.S
+kalloc.c
+
+# system calls
+traps.h
+vectors.pl
+trapasm.S
+trap.c
+syscall.h
+syscall.c
+sysproc.c
+exec.c
+
+# low-level hardware
+mp.h
+mp.c
+lapic.c
+ioapic.c
+kbd.h
+kbd.c
+console.c
+uart.c
+
+# file system and I/O
+buf.h
+fcntl.h
+stat.h
+ide.c
+bio.c
+sleeplock.h
+sleeplock.c
+log.c
+fs.h
+fs.c
+file.h
+file.c
+sysfile.c
+pipe.c
+
+# string operations
+string.c
+
+# user-level
+initcode.S
+usys.S
+init.c
+sh.c
