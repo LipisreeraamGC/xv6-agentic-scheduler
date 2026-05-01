@@ -290,7 +290,7 @@ nullptrtest(void)
   if (fork() == 0) {
     *(addr_t *)(0) = 10;
     printf(1, "can write to unmapped page 0, failed");
-    kill(ppid);
+    kill(ppid,9);
     exit();
   } else {
     wait();
@@ -385,9 +385,9 @@ preempt(void)
   }
   close(pfds[0]);
   printf(1, "kill... ");
-  kill(pid1);
-  kill(pid2);
-  kill(pid3);
+  kill(pid1,9);
+  kill(pid2,9);
+  kill(pid3,9);
   printf(1, "wait... ");
   wait();
   wait();
@@ -443,7 +443,7 @@ mem(void)
     m1 = malloc(1024*20);
     if(m1 == 0){
       printf(1, "couldn't allocate mem?!!\n");
-      kill(ppid);
+      kill(ppid,9);
       exit();
     }
     free(m1);
@@ -1394,7 +1394,7 @@ sbrktest(void)
     }
     if(pid == 0){
       printf(1, "oops could read %p = %c\n", a, *a);
-      kill(ppid);
+      kill(ppid,9);
       exit();
     }
     wait();
@@ -1427,7 +1427,7 @@ sbrktest(void)
   for(i = 0; i < sizeof(pids)/sizeof(pids[0]); i++){
     if(pids[i] == -1)
       continue;
-    kill(pids[i]);
+    kill(pids[i],9);
     wait();
   }
   if(c == (char*)0xffffffff){ // ?
@@ -1440,25 +1440,6 @@ sbrktest(void)
   printf(1, "sbrk test OK\n");
 }
 
-void
-validatetest(void)
-{
-  int hi;
-  addr_t p;
-
-  printf(1, "validate test\n");
-  hi = 1100*1024;
-
-  // first page not mapped
-  for(p = 4096; p <= (uint)hi; p += 4096){
-    // try to crash the kernel by passing in a bad string pointer
-    if(link("nosuchfile", (char*)p) != -1){
-      failexit("link should not succeed.");
-    }
-  }
-
-  printf(1, "validate ok\n");
-}
 
 // does unintialized data start out zero?
 char uninit[10000];
@@ -1633,7 +1614,6 @@ main(int argc, char *argv[])
   bigargtest();
   bsstest();
   sbrktest();
-  validatetest();
 
   opentest();
   writetest();

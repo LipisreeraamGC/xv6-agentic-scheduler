@@ -154,6 +154,7 @@ struct segdesc {
 
 #define PGROUNDUP(sz)  (((sz)+((addr_t)PGSIZE-1)) & ~((addr_t)(PGSIZE-1)))
 #define PGROUNDDOWN(a) (((a)) & ~((addr_t)(PGSIZE-1)))
+#define PGINDEX(physaddr) (((addr_t)(physaddr))/PGSIZE)
 
 // Page table/directory entry flags.
 #define PTE_P           0x001   // Present

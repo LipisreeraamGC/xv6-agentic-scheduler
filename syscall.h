@@ -20,3 +20,14 @@
 #define SYS_link   19
 #define SYS_mkdir  20
 #define SYS_close  21
+
+#define SYS_alarm  22
+#define SYS_signal 23
+#define SYS_sigret 24
+#define SYS_fgproc 25
+
+/* MLFQ+SJF scheduler syscalls -- start at 26 to avoid SYS_fgproc=25 */
+#define SYS_getschedstats  26
+#define SYS_setschedparam  27
+#define SYS_register_agent 28
+

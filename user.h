@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "schedstat.h"
 struct stat;
 struct rtcdate;
 
@@ -11,7 +12,7 @@ int pipe(int*);
 int write(int, void*, int);
 int read(int, void*, int);
 int close(int);
-int kill(int);
+int kill(int, int);
 int exec(char*, char**);
 int open(char*, int);
 int mknod(char*, short, short);
@@ -25,6 +26,16 @@ int getpid(void);
 char* sbrk(uint64);
 int sleep(int);
 int uptime(void);
+
+void alarm(int);
+void signal(int,void (*)(int));
+void sigret(void);
+void fgproc();
+
+/* MLFQ+SJF scheduler syscalls */
+int getschedstats(struct schedstat*, int);
+int setschedparam(struct sched_update *);
+int register_agent(void);
 
 // ulib.c
 int stat(char*, struct stat*);

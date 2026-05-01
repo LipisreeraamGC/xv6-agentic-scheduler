@@ -101,6 +101,7 @@ argstr(int n, char **pp)
   return fetchstr(addr, pp);
 }
 
+
 extern addr_t sys_chdir(void);
 extern addr_t sys_close(void);
 extern addr_t sys_dup(void);
@@ -122,9 +123,18 @@ extern addr_t sys_unlink(void);
 extern addr_t sys_wait(void);
 extern addr_t sys_write(void);
 extern addr_t sys_uptime(void);
+extern addr_t sys_alarm(void);
+extern addr_t sys_kill(void);
+extern addr_t sys_signal(void);
+extern addr_t sys_sigret(void);
+extern addr_t sys_fgproc(void);
+extern addr_t sys_getschedstats(void);
+extern addr_t sys_setschedparam(void);
+extern addr_t sys_register_agent(void);
 
 // PAGEBREAK!
 static addr_t (*syscalls[])(void) = {
+
 [SYS_fork]    sys_fork,
 [SYS_exit]    sys_exit,
 [SYS_wait]    sys_wait,
@@ -146,6 +156,15 @@ static addr_t (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+
+[SYS_alarm]   sys_alarm,
+[SYS_kill]    sys_kill,
+[SYS_signal]  sys_signal,
+[SYS_sigret]  sys_sigret,
+[SYS_fgproc]         sys_fgproc,
+[SYS_getschedstats]  sys_getschedstats,
+[SYS_setschedparam]  sys_setschedparam,
+[SYS_register_agent] sys_register_agent,
 };
 
 void
@@ -160,6 +179,5 @@ syscall(struct trapframe *tf)
             proc->pid, proc->name, num);
     tf->rax = -1;
   }
-  if (proc->killed)
-    exit();
+  check_signals();
 }

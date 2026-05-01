@@ -1,3 +1,5 @@
+#include "x86.h"
+#include "schedstat.h"
 // Per-CPU state
 struct cpu {
   uchar id;
@@ -45,6 +47,33 @@ struct context {
 };
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+enum signal { SIGINT=2, SIGKILL=9, SIGALRM=14 };
+
+/*
+ * spinlock.h needs struct cpu (defined above) only as a pointer --
+ * include it here so struct sched_params can embed a struct spinlock.
+ */
+#include "spinlock.h"
+
+/*
+ * Tunable scheduler parameters -- modified by agent via setschedparam syscall.
+ * Separate spinlock from ptable.lock; acquire ptable.lock first if both needed.
+ */
+struct sched_params {
+  struct spinlock lock;
+  int q0_quantum;        /* ticks for Q0 processes (default: 1) */
+  int q1_quantum;        /* ticks for Q1 processes (default: 2) */
+  int q2_quantum;        /* ticks for Q2 processes (default: 4) */
+  int boost_interval;    /* ticks between priority boosts (default: 100) */
+  int ema_alpha_fast;    /* fast EMA alpha * 100 (default: 50 = 0.5) */
+  int ema_alpha_slow;    /* slow EMA alpha * 100 (default: 10 = 0.1) */
+  int aging_factor;      /* aging divisor for effective_score (default: 10) */
+  int agent_pid;         /* PID of registered agent -- 0 if none */
+  int sched_alert;       /* set by kernel when starvation threshold crossed */
+  int rr_mode;           /* 1 = plain round-robin (bypass MLFQ+SJF); 0 = MLFQ */
+};
+
+extern struct sched_params schedp;
 
 // Per-process state
 struct proc {
@@ -61,6 +90,26 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct trapframe tf_backup; 
+  enum signal signal_pending;
+  int alarm_ticks;       // original interval in ticks (0 = no alarm)
+  int alarm_countdown;   // ticks remaining until SIGALRM fires
+  uint64 sig_disp[32];      // sig_disp[signum]: 0=SIG_DFL (kill), 1=SIG_IGN
+
+  /* MLFQ+SJF scheduler fields -- added for term project */
+  int queue_level;       /* MLFQ queue: 0=highest, 1=medium, 2=lowest */
+  int ticks_remaining;   /* ticks left in current quantum; <= 0 triggers yield */
+  int wait_ticks;        /* scheduling decisions spent RUNNABLE but not picked */
+  int burst_ema_fast;    /* fast burst EMA: alpha=50, scaled by 100 */
+  int burst_ema_slow;    /* slow burst EMA: alpha=10, scaled by 100 */
+  int burst_start_tick;  /* tick when current CPU burst started */
+  int yield_count;       /* voluntary context switches (process called yield) */
+  int preempt_count;     /* forced context switches (quantum exhausted) */
+  int burst_variance;    /* |burst_ema_fast - burst_ema_slow| */
+  int page_fault_count;  /* page faults since last reset */
+  int effective_score;   /* SJF score with aging: burst_ema_fast/100 - wait/aging */
+  int first_run_tick;    /* uptime tick when process was first scheduled; 0 = never */
+  int create_tick;       /* uptime tick when allocproc() ran (job arrival time) */
 };
 
 // Process memory is laid out contiguously, low addresses first:

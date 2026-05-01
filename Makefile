@@ -119,6 +119,12 @@ mkfs: mkfs.c fs.h
 UPROGS= \
 	_cat _echo _forktest _grep _init _kill _ln _ls _mkdir \
 	_rm _sh _stressfs _usertests _wc _zombie \
+	_alarmtest1 _alarmtest2 _alarmtest3 _helloloop \
+	_sagent _schedtop _bench_cpu _bench_io _bench_mixed _bench_interactive _bench_hog \
+	_sec_priv_escalate _sec_param_corrupt _sec_fork_bomb \
+	_sec_sjf_abuse _sec_behavioral_mimic _sec_prompt_inject \
+	_config_rr _config_mlfq \
+	_attack_priv
 #
 
 fs.img: mkfs README $(UPROGS)

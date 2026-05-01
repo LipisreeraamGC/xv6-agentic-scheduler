@@ -220,6 +220,9 @@ consoleintr(int (*getc)(void))
     case C('P'):  // Process listing.
       procdump();
       break;
+    case C('C'):  // Ctrl-C: send SIGINT to the foreground process
+      send_fgsig(SIGINT);
+      break;
     case C('U'):  // Kill line.
       while(input.e != input.w &&
           input.buf[(input.e-1) % INPUT_BUF] != '\n'){

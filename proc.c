@@ -7,6 +7,9 @@
 #include "proc.h"
 #include "spinlock.h"
 
+/* Tunable scheduler parameters -- see proc.h for field descriptions */
+struct sched_params schedp;
+
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
@@ -24,6 +27,17 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  initlock(&schedp.lock, "schedp");
+  schedp.q0_quantum     = 4;
+  schedp.q1_quantum     = 6;
+  schedp.q2_quantum     = 8;
+  schedp.boost_interval = 500;
+  schedp.ema_alpha_fast = 50;
+  schedp.ema_alpha_slow = 10;
+  schedp.aging_factor   = 50;
+  schedp.agent_pid      = 0;
+  schedp.sched_alert    = 0;
+  schedp.rr_mode        = 0;
 }
 
 //PAGEBREAK: 32
@@ -48,7 +62,26 @@ allocproc(void)
 
 found:
   p->state = EMBRYO;
+  p->signal_pending = 0;
+  p->alarm_ticks = 0;
+  p->alarm_countdown = 0;
+  memset(p->sig_disp, 0, sizeof(p->sig_disp));
   p->pid = nextpid++;
+
+  /* MLFQ+SJF fields: all new processes start in Q0 */
+  p->queue_level      = 0;
+  p->ticks_remaining  = 1;   /* Q0 quantum; reset by scheduler before each run */
+  p->wait_ticks       = 0;
+  p->burst_ema_fast   = 100; /* scaled by 100: initial estimate = 1 tick */
+  p->burst_ema_slow   = 100;
+  p->burst_start_tick = 0;
+  p->yield_count      = 0;
+  p->preempt_count    = 0;
+  p->burst_variance   = 0;
+  p->page_fault_count = 0;
+  p->effective_score  = 0;
+  p->first_run_tick   = 0;
+  p->create_tick      = ticks;
 
   release(&ptable.lock);
 
@@ -196,6 +229,12 @@ exit(void)
 
   acquire(&ptable.lock);
 
+  /* Release agent slot if this process held it */
+  acquire(&schedp.lock);
+  if(schedp.agent_pid == proc->pid)
+    schedp.agent_pid = 0;
+  release(&schedp.lock);
+
   // Parent might be sleeping in wait().
   wakeup1(proc->parent);
 
@@ -269,40 +308,126 @@ wait(void)
 void
 scheduler(void)
 {
-  int i = 0;
   struct proc *p;
-  int skipped = 0;
-  for(;;){
-    ++i;
-    // Enable interrupts on this processor.
+  struct proc *best;
+  int q;
+  int nothing_found;
+  int snap_boost, snap_q0, snap_q1, snap_q2, snap_aging, snap_rr;
+  static uint last_boost_tick = 0;
+
+  for(;;) {
     sti();
-    // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE) {
-        skipped++;
-        continue;
+    nothing_found = 1;
+
+    /* Snapshot schedp once per pass under its lock so the scheduler
+     * sees a coherent parameter set even if the agent updates mid-pass. */
+    acquire(&schedp.lock);
+    snap_boost  = schedp.boost_interval;
+    snap_q0     = schedp.q0_quantum;
+    snap_q1     = schedp.q1_quantum;
+    snap_q2     = schedp.q2_quantum;
+    snap_aging  = schedp.aging_factor;
+    snap_rr     = schedp.rr_mode;
+    release(&schedp.lock);
+
+    /*
+     * Step 1: Priority boost.
+     */
+    if(ticks - last_boost_tick >= (uint)snap_boost) {
+      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+        if(p->state == UNUSED) continue;
+        p->queue_level     = 0;
+        p->ticks_remaining = snap_q0;
+        p->wait_ticks      = 0;
       }
-      skipped = 0;
+      last_boost_tick = ticks;
+    }
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-      swtch(&cpu->scheduler, p->context);
+    /*
+     * Step 2: Age all RUNNABLE processes.
+     * Each pass through the scheduler loop counts as one scheduling
+     * decision; processes that keep losing the SJF contest accumulate
+     * wait_ticks and eventually win via the aging term.
+     */
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+      if(p->state != RUNNABLE) continue;
+      p->wait_ticks++;
+      /* Alert the agent when any process is starving */
+      if(p->wait_ticks > 100 && schedp.sched_alert == 0) {  /* sched_alert written under its own lock below */
+        acquire(&schedp.lock);
+        schedp.sched_alert = 1;
+        release(&schedp.lock);
+      }
+    }
+
+    /*
+     * Step 3: Process selection.
+     * snap_rr=1: true round-robin baseline -- rotating start index avoids
+     *            PID bias (lower-numbered procs would always win a fixed scan).
+     * snap_rr=0: MLFQ+SJF -- check queues in priority order, pick lowest score.
+     */
+    best = 0;
+    if(snap_rr) {
+      /* True round-robin: advance start index after each pick */
+      static int rr_next = 0;
+      int i;
+      for(i = 0; i < NPROC; i++) {
+        p = &ptable.proc[(rr_next + i) % NPROC];
+        if(p->state == RUNNABLE) {
+          best = p;
+          rr_next = (int)(p - ptable.proc + 1) % NPROC;
+          break;
+        }
+      }
+    } else {
+      for(q = 0; q <= 2; q++) {
+        for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+          if(p->state != RUNNABLE) continue;
+          if(p->queue_level != q) continue;
+          /* Lower score = higher priority */
+          p->effective_score = p->burst_ema_fast / 100
+                               - (p->wait_ticks / snap_aging);
+          if(best == 0 || p->effective_score < best->effective_score)
+            best = p;
+        }
+        if(best != 0) break; /* found something in this queue -- stop */
+      }
+    }
+
+    /*
+     * Step 4: Dispatch best process.
+     */
+    if(best != 0) {
+      nothing_found = 0;
+      best->wait_ticks      = 0;      /* reset wait counter on dispatch */
+      best->burst_start_tick = ticks; /* record burst start for EMA update */
+
+      /* Record first-ever scheduling time for response time measurement */
+      if(best->first_run_tick == 0)
+        best->first_run_tick = ticks;
+
+      /* Assign a fresh quantum from the consistent snapshot */
+      if(best->queue_level == 0)
+        best->ticks_remaining = snap_q0;
+      else if(best->queue_level == 1)
+        best->ticks_remaining = snap_q1;
+      else
+        best->ticks_remaining = snap_q2;
+
+      proc = best;
+      switchuvm(best);
+      best->state = RUNNING;
+      swtch(&cpu->scheduler, best->context);
       switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
       proc = 0;
     }
+
     release(&ptable.lock);
-    if (skipped > NPROC) {
+
+    /* Step 5: Halt when nothing is runnable -- preserves original hlt() path */
+    if(nothing_found)
       hlt();
-      skipped = 0;
-    }
   }
 }
 
@@ -336,7 +461,8 @@ sched(void)
 void
 yield(void)
 {
-  acquire(&ptable.lock);  //DOC: yieldlock
+  acquire(&ptable.lock);  /*DOC: yieldlock*/
+  proc->yield_count++;    /* count voluntary context switches for workload detection */
   proc->state = RUNNABLE;
   sched();
   release(&ptable.lock);
@@ -423,27 +549,199 @@ wakeup(void *chan)
   release(&ptable.lock);
 }
 
-// Kill the process with the given pid.
-// Process won't exit until it returns
-// to user space (see trap in trap.c).
+void
+check_alarms(void)
+{
+  struct proc *p;
+  acquire(&ptable.lock);
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+    if(p->alarm_ticks > 0) {
+      p->alarm_countdown--;
+      if(p->alarm_countdown <= 0) {
+        cprintf("got a kill for %d signal %d\n", p->pid, SIGALRM);
+        p->signal_pending = SIGALRM;
+        p->alarm_ticks = 0;
+        p->alarm_countdown = 0;
+        if(p->state == SLEEPING)
+          p->state = RUNNABLE;
+      }
+    }
+  }
+  release(&ptable.lock);
+}
+
+
+void
+alarm(int secs) {
+  // actual work is in sys_alarm() — this kernel stub is unused
+  (void)secs;
+}
+
+void
+signal(int signum, void (*handler)(int)) {
+  cprintf("In signal(), with number %d and handler %p\n",
+          signum, (addr_t)handler);
+  if(signum >= 0 && signum < 32)
+    proc->sig_disp[signum] = (uint64)(addr_t)handler;
+}
+
+void
+check_signals()
+{
+  if(proc == 0)
+    return;
+
+  // Hard kill (e.g. from a trap fault)
+  if(proc->killed)
+    exit();
+
+  if(proc->signal_pending == 0)
+    return;
+
+  int signum    = (int)proc->signal_pending;
+  uint64 disp   = proc->sig_disp[signum];
+
+  cprintf("Checking signals, pending is %d\n", signum);
+
+  if(disp == 1){
+    // SIG_IGN: discard silently
+    proc->signal_pending = 0;
+    return;
+  }
+
+  if(disp == 0){
+    // SIG_DFL: terminate
+    cprintf("got a signal %d, exiting\n", signum);
+    exit();
+  }
+
+  // --- User-space handler ---
+  void (*handler)(int) = (void(*)(int))(addr_t)disp;
+
+  // Back up the current trapframe.
+  // Normalise rcx to rip so that syscall_trapret (sysretq path)
+  // returns to the right user PC after sys_sigret restores the backup.
+  proc->tf_backup     = *proc->tf;
+  proc->tf_backup.rcx = proc->tf->rip;
+
+  proc->signal_pending = 0;
+
+  // Trampoline machine code (identical to the sigret stub in usys.S):
+  //   48 c7 c0 18 00 00 00   movq $24 (SYS_sigret), %rax
+  //   49 89 ca               movq %rcx, %r10
+  //   0f 05                  syscall
+  //   c3                     retq
+  static uchar sigret_code[] = {
+    0x48, 0xc7, 0xc0, 0x18, 0x00, 0x00, 0x00,
+    0x49, 0x89, 0xca,
+    0x0f, 0x05,
+    0xc3
+  };
+
+  addr_t usp = proc->tf->rsp;
+
+  // Push trampoline bytes onto the user stack
+  usp -= sizeof(sigret_code);
+  usp &= ~(addr_t)0xF;   // 16-byte align
+  copyout(proc->pgdir, usp, sigret_code, sizeof(sigret_code));
+  addr_t trampoline = usp;
+
+  // Push the trampoline address as the handler's return address
+  usp -= 8;
+  copyout(proc->pgdir, usp, &trampoline, 8);
+
+  // Redirect execution to the handler
+  proc->tf->rsp = usp;              // user %rsp: return addr on top
+  proc->tf->rcx = (addr_t)handler;  // sysretq path: RIP ← %rcx
+  proc->tf->rip = (addr_t)handler;  // iretq   path: RIP ← tf->rip
+  proc->tf->rdi = signum;            // first argument to handler
+}
+
+// Signal the process with the given pid and signal
 int
-kill(int pid)
+kill(int pid, int signum)
 {
   struct proc *p;
 
   acquire(&ptable.lock);
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
     if(p->pid == pid){
-      p->killed = 1;
+      cprintf("got a kill for %d signal %d\n", pid, signum);
+      p->signal_pending = signum;
+
       // Wake process from sleep if necessary.
       if(p->state == SLEEPING)
         p->state = RUNNABLE;
       release(&ptable.lock);
+
       return 0;
     }
   }
   release(&ptable.lock);
+
   return -1;
+}
+
+// Send a signal to the foreground process (called from consoleintr)
+int fgpid = 0;
+
+void
+send_fgsig(int signum)
+{
+  if(fgpid > 0)
+    kill(fgpid, signum);
+}
+
+
+/*
+ * kern_getschedstats -- kernel helper for sys_getschedstats.
+ * Copies a telemetry snapshot of all non-UNUSED processes into buf.
+ * Returns the number of entries written.
+ * Piggybacks sched_alert on buf[0] so the agent sees starvation alerts
+ * in the same call (no extra syscall needed).
+ */
+int
+kern_getschedstats(struct schedstat *buf, int maxproc)
+{
+  int n;
+  struct proc *p;
+
+  n = 0;
+  acquire(&ptable.lock);
+  for(p = ptable.proc; p < &ptable.proc[NPROC] && n < maxproc; p++) {
+    if(p->state == UNUSED) continue;
+    buf[n].pid              = p->pid;
+    buf[n].state            = (int)p->state;
+    buf[n].queue_level      = p->queue_level;
+    buf[n].burst_ema_fast   = p->burst_ema_fast;
+    buf[n].burst_ema_slow   = p->burst_ema_slow;
+    buf[n].wait_ticks       = p->wait_ticks;
+    buf[n].yield_count      = p->yield_count;
+    buf[n].preempt_count    = p->preempt_count;
+    buf[n].burst_variance   = p->burst_variance;
+    buf[n].page_fault_count = p->page_fault_count;
+    buf[n].effective_score  = p->effective_score;
+    buf[n].sched_alert      = (n == 0) ? schedp.sched_alert : 0;
+    buf[n].first_run_tick   = p->first_run_tick;
+    buf[n].create_tick      = p->create_tick;
+    n++;
+  }
+  release(&ptable.lock);
+  return n;
+}
+
+/*
+ * kern_pin_agent -- pin the current process permanently to Q0.
+ * Must hold ptable.lock to write queue_level/ticks_remaining because
+ * the scheduler reads them under that same lock.
+ */
+void
+kern_pin_agent(void)
+{
+  acquire(&ptable.lock);
+  proc->queue_level     = 0;
+  proc->ticks_remaining = schedp.q0_quantum;
+  release(&ptable.lock);
 }
 
 //PAGEBREAK: 36

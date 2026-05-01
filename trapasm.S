@@ -87,6 +87,8 @@ syscall_entry:
 
 .global syscall_trapret
 syscall_trapret:
+syscall_sigtrapret:
+
   popq    %rax
   popq    %rbx
   popq    %rcx

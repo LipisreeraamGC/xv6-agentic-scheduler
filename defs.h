@@ -5,6 +5,7 @@ struct inode;
 struct pipe;
 struct proc;
 struct rtcdate;
+struct schedstat;
 struct spinlock;
 struct sleeplock;
 struct stat;
@@ -74,6 +75,11 @@ char*           kalloc(void);
 void            kfree(char*);
 void            kinit1(void*, void*);
 void            kinit2();
+void            krelease(char*);
+void            kretain(char*);
+int             krefcount(char*);
+void            update_checksum(addr_t);
+int             frames_are_identical(addr_t, addr_t);
 
 // kbd.c
 void            kbdintr(void);
@@ -108,7 +114,7 @@ int             pipewrite(struct pipe*, char*, int);
 void            exit(void);
 int             fork(void);
 int             growproc(int64);
-int             kill(int);
+int             kill(int,int);
 void            pinit(void);
 void            procdump(void);
 void            scheduler(void) __attribute__((noreturn));
@@ -118,6 +124,17 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
+
+void            alarm(int);
+void            check_alarms(void);
+void            signal(int, void (*)(int));
+void            check_signals();
+void            fgproc();
+void            send_fgsig(int);
+
+/* MLFQ+SJF kernel helpers */
+int             kern_getschedstats(struct schedstat*, int);
+void            kern_pin_agent(void);
 
 // swtch.S
 void            swtch(struct context**, struct context*);
